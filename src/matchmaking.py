@@ -2,10 +2,10 @@
 matchmaking.py - Motor de matchmaking logístico do MESAFARTAI.
 
 Para cada doação:
-    1. descarta ONGs inativas
-    2. descarta ONGs que restringem alguma categoria da doação (líquidos / perecíveis / congelados)
-    3. KNN (vizinhos mais próximos) com distância de Haversine sobre as ONGs restantes
-    4. oferece NO MÁXIMO 2 opções ao doador: a mais próxima e, se ele recusar, a segunda
+1. descarta ONGs inativas
+2. descarta ONGs que restringem alguma categoria da doação (líquidos / perecíveis / congelados)
+3. KNN (vizinhos mais próximos) com distância de Haversine sobre as ONGs restantes
+4. oferece NO MÁXIMO 2 opções ao doador: a mais próxima e, se ele recusar, a segunda
 
 Por que Haversine e não distância euclidiana em latitude/longitude?
     A Terra é esférica: 1° de longitude em São Paulo (~23° S) mede ~102 km, e 1° de latitude ~111 km.
@@ -13,11 +13,12 @@ Por que Haversine e não distância euclidiana em latitude/longitude?
     (veja tests/test_matchmaking.py::test_haversine_corrige_euclidiana).
 
 O módulo é separado em duas camadas:
-    * funções puras (distância, filtro, ranking) -> fáceis de testar e de ensinar
-    * `MotorMatchmaking.oferecer_proxima_opcao` -> conversa com o banco (database.py)
+- funções puras (distância, filtro, ranking) -> fáceis de testar e de ensinar
+- `MotorMatchmaking.oferecer_proxima_opcao` -> conversa com o banco (database.py)
 
 Teste rápido:  python src/matchmaking.py
 """
+from datetime import datetime  # [NOVO AJUSTE - REGRA DE NEGÓCIO]
 import math
 
 import numpy as np
@@ -27,6 +28,7 @@ import database as db
 
 RAIO_TERRA_KM = 6371.0088
 MAX_OPCOES = 2  # regra do projeto: o doador nunca recebe mais de duas opções
+RAIO_URGENCIA_ALTA_KM = 15.0  # [NOVO AJUSTE] Raio máximo recomendado para coleta no mesmo dia
 
 
 # ----------------------------------------------------------------------------
@@ -55,14 +57,40 @@ def restricoes_conflitantes(ong, categorias):
     return db.restricoes_como_conjunto(ong.get("restricoes_alimentares")) & set(categorias or [])
 
 
+# [NOVO AJUSTE - REGRA DE NEGÓCIO #2] Classificação de urgência logística no motor
+def avaliar_urgencia_doacao(data_validade):
+    """Retorna (nivel_urgencia, raio_sugerido_km) com base na data de validade da doação."""
+    if not data_validade:
+        return "🟢 NORMAL", None
+    val_str = str(data_validade).strip()
+    dt_val = None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            dt_val = datetime.strptime(val_str[:10], fmt).date()
+            break
+        except ValueError:
+            continue
+    if dt_val is None:
+        return "🟢 NORMAL", None
+
+    dias_restantes = (dt_val - datetime.now().date()).days
+    if dias_restantes <= 0:
+        return "🚨 ALTA (Hoje)", RAIO_URGENCIA_ALTA_KM
+    elif dias_restantes == 1:
+        return "⚠️ MÉDIA (24h)", None
+    return "🟢 NORMAL", None
+
+
 def ranquear_ongs(latitude, longitude, ongs, max_opcoes=MAX_OPCOES):
     """
     KNN com métrica Haversine. Recebe ONGs já filtradas e devolve as `max_opcoes` mais próximas,
-    da mais perto para a mais longe: [(ong, distancia_km), ...]. Empates desempatam pelo id da ONG.
+    da mais perto para a mais longe: [(ong, distancia_km), ...].
+    Empates desempatam por maior capacidade cadastrada e depois pelo id da ONG.
     """
     if not ongs:
         return []
-    ongs = sorted(ongs, key=lambda o: o["id"])  # ordem estável => resultado determinístico
+    # [NOVO AJUSTE - REGRA DE NEGÓCIO] Ordenação estável priorizando maior capacidade no desempate
+    ongs = sorted(ongs, key=lambda o: (-(o.get("capacidade_kg") or 0.0), o["id"]))
     coords = np.radians([[o["latitude"], o["longitude"]] for o in ongs])
     k = min(max_opcoes, len(ongs))  # pedir mais vizinhos do que ONGs causaria erro no sklearn
     knn = NearestNeighbors(n_neighbors=k, metric="haversine", algorithm="ball_tree").fit(coords)
@@ -79,7 +107,8 @@ class MotorMatchmaking:
         self.raio_max_km = raio_max_km
 
     # --- cálculo (sem gravar nada) ------------------------------------------------
-    def sugerir(self, latitude, longitude, categorias=(), excluir_ong_ids=(), max_opcoes=MAX_OPCOES, ongs=None):
+    def sugerir(self, latitude, longitude, categorias=(), excluir_ong_ids=(), max_opcoes=MAX_OPCOES,
+                ongs=None, raio_limite_override=None):
         """
         Calcula as melhores opções para uma doação, sem gravar no banco.
 
@@ -105,9 +134,12 @@ class MotorMatchmaking:
 
         ranking = ranquear_ongs(lat, lon, compativeis, max_opcoes)
         por_distancia = 0
-        if self.raio_max_km is not None:
-            por_distancia = sum(1 for _, d in ranking if d > self.raio_max_km)
-            ranking = [(o, d) for o, d in ranking if d <= self.raio_max_km]
+
+        # [NOVO AJUSTE - REGRA DE NEGÓCIO] Usa o raio da instância ou o raio dinâmico de urgência
+        raio_efetivo = self.raio_max_km if self.raio_max_km is not None else raio_limite_override
+        if raio_efetivo is not None:
+            por_distancia = sum(1 for _, d in ranking if d > raio_efetivo)
+            ranking = [(o, d) for o, d in ranking if d <= raio_efetivo]
 
         return {
             "opcoes": [{"ong_id": o["id"], "ong_nome": o["nome"], "distancia_km": round(d, 2), "ong": o}
@@ -127,7 +159,7 @@ class MotorMatchmaking:
         opção aguardando resposta, ela é devolvida em vez de criar outra.
 
         Retorna um dicionário com "status":
-            OFERECIDA  -> opção registrada (ordem, match_id, ong, distancia_km, ha_segunda_opcao)
+            OFERECIDA  -> opção registrada (ordem, match_id, ong, distancia_km, ha_segunda_opcao, urgencia)
             PENDENTE   -> já havia uma opção aguardando resposta (mesmos campos de OFERECIDA)
             SEM_OPCAO  -> não há ONG compatível (motivo: sem_ong_compativel | sem_segunda_opcao);
                           a doação passa a SEM_DESTINO
@@ -141,14 +173,18 @@ class MotorMatchmaking:
         if doacao["latitude"] is None or doacao["longitude"] is None:
             raise ValueError("A doação não tem coordenadas: geocodifique o CEP/endereço antes do match.")
 
+        # [NOVO AJUSTE - REGRA DE NEGÓCIO #2] Avalia urgência e raio logístico pela data de validade
+        urgencia, raio_urgencia = avaliar_urgencia_doacao(doacao.get("data_validade"))
+
         matches = doacao["matches"]
         categorias = [c.strip() for c in (doacao["categorias"] or "").split(",") if c.strip()]
         pendente = next((m for m in matches if m["status"] == "SUGERIDO"), None)
         if pendente:
-            resultado = self._resultado("PENDENTE", pendente)
+            resultado = self._resultado("PENDENTE", pendente, urgencia=urgencia)
             if pendente["ordem"] == 1:  # ainda existe uma 2ª opção disponível?
                 resto = self.sugerir(doacao["latitude"], doacao["longitude"], categorias,
-                                     excluir_ong_ids=[pendente["ong_id"]], max_opcoes=1)
+                                     excluir_ong_ids=[pendente["ong_id"]], max_opcoes=1,
+                                     raio_limite_override=raio_urgencia)
                 resultado["ha_segunda_opcao"] = bool(resto["opcoes"])
             else:
                 resultado["ha_segunda_opcao"] = False
@@ -157,14 +193,16 @@ class MotorMatchmaking:
         ordem = len(matches) + 1
         if ordem > MAX_OPCOES:
             db.marcar_sem_destino(doacao_id)
-            return {"status": "SEM_OPCAO", "ordem": ordem, "motivo": "limite_de_opcoes"}
+            return {"status": "SEM_OPCAO", "ordem": ordem, "motivo": "limite_de_opcoes", "urgencia": urgencia}
 
         calculo = self.sugerir(doacao["latitude"], doacao["longitude"], categorias,
-                               excluir_ong_ids=[m["ong_id"] for m in matches], max_opcoes=MAX_OPCOES)
+                               excluir_ong_ids=[m["ong_id"] for m in matches], max_opcoes=MAX_OPCOES,
+                               raio_limite_override=raio_urgencia)
         if not calculo["opcoes"]:
             db.marcar_sem_destino(doacao_id)
             return {"status": "SEM_OPCAO", "ordem": ordem,
-                    "motivo": "sem_ong_compativel" if ordem == 1 else "sem_segunda_opcao", "detalhe": calculo}
+                    "motivo": "sem_ong_compativel" if ordem == 1 else "sem_segunda_opcao",
+                    "urgencia": urgencia, "detalhe": calculo}
 
         escolhida = calculo["opcoes"][0]
         match_id = db.registrar_match(doacao_id, escolhida["ong_id"], ordem, escolhida["distancia_km"])
@@ -173,14 +211,16 @@ class MotorMatchmaking:
             "id": match_id, "ordem": ordem, "distancia_km": escolhida["distancia_km"],
             "ong_id": ong["id"], "ong_nome": ong["nome"], "telefone": ong["telefone"], "email": ong["email"],
             "cep": ong["cep"], "numero": ong["numero"], "logradouro": ong["logradouro"],
-            "bairro": ong["bairro"], "cidade": ong["cidade"], "horario_recebimento": ong["horario_recebimento"]})
+            "bairro": ong["bairro"], "cidade": ong["cidade"], "horario_recebimento": ong["horario_recebimento"]},
+            urgencia=urgencia)
         resultado["ha_segunda_opcao"] = ordem == 1 and len(calculo["opcoes"]) > 1
         return resultado
 
     @staticmethod
-    def _resultado(status, m):
+    def _resultado(status, m, urgencia="🟢 NORMAL"):
         return {
-            "status": status, "ordem": m["ordem"], "match_id": m.get("id"), "distancia_km": m["distancia_km"],
+            "status": status, "ordem": m["ordem"], "match_id": m.get("id"),
+            "distancia_km": m["distancia_km"], "urgencia": urgencia,
             "ong": {k: m.get(k) for k in ("ong_id", "ong_nome", "telefone", "email", "cep", "numero",
                                            "logradouro", "bairro", "cidade", "horario_recebimento")},
         }
