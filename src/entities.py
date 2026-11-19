@@ -2,7 +2,7 @@
 entities.py - Extração de entidades das mensagens do doador (MESAFARTAI).
 
 O que extrai de um texto livre:
-    nome, e-mail, CEP / endereço, itens (alimento + quantidade + unidade + categorias) e validade.
+    nome, e-mail, CEP / endereço, itens (alimento + quantidade + unidade + categorias), validade e urgência.
 
 Estratégia (ótima para ensinar):
     1ª linha  -> Regex   (e-mail, CEP, datas, horas, quantidades, endereços)
@@ -416,7 +416,31 @@ class ExtratorEntidades:
             return []
         return None
 
-    # --- validade ---------------------------------------------------------------
+    # --- validade e urgência ----------------------------------------------------
+    # [NOVO AJUSTE - REGRA DE NEGÓCIO #2] Classificação de prioridade por perecibilidade
+    def classificar_urgencia(self, data_validade, validade_texto=None, agora=None):
+        """
+        Classifica a prioridade logística da doação com base na validade extraída:
+        - Vence hoje (<= 0 dias) ou "perto do vencimento" -> "🚨 ALTA (Hoje)"
+        - Vence amanhã (1 dia)                          -> "⚠️ MÉDIA (24h)"
+        - Demais prazos / não informada                 -> "🟢 NORMAL"
+        """
+        if validade_texto == "perto do vencimento":
+            return "🚨 ALTA (Hoje)"
+        if not data_validade:
+            return "🟢 NORMAL"
+        hoje = (agora or self._agora()).date()
+        try:
+            dt_val = date.fromisoformat(str(data_validade)[:10])
+        except ValueError:
+            return "🟢 NORMAL"
+        dias_restantes = (dt_val - hoje).days
+        if dias_restantes <= 0:
+            return "🚨 ALTA (Hoje)"
+        if dias_restantes == 1:
+            return "⚠️ MÉDIA (24h)"
+        return "🟢 NORMAL"
+
     def extrair_validade(self, texto, agora=None, resposta_direta=False):
         """
         Só considera validade quando há uma pista ("vence", "validade", "válido até"...), para não
@@ -519,6 +543,8 @@ class ExtratorEntidades:
             "descricao_alimento": self.descrever_itens(itens) or None,
             "data_validade": validade["data_validade"],
             "validade_texto": validade["validade_texto"],
+            # [NOVO AJUSTE - REGRA DE NEGÓCIO #2] Prioridade logística calculada automaticamente
+            "urgencia": self.classificar_urgencia(validade["data_validade"], validade["validade_texto"], agora),
             "alertas": validade["alertas"],
         }
 
@@ -540,7 +566,13 @@ class ExtratorEntidades:
             return {"cep": cep, "endereco_texto": endereco}
         if campo == "validade":
             v = self.extrair_validade(texto, agora, resposta_direta=True)
-            return {"data_validade": v["data_validade"], "validade_texto": v["validade_texto"], "alertas": v["alertas"]}
+            return {
+                "data_validade": v["data_validade"],
+                "validade_texto": v["validade_texto"],
+                # [NOVO AJUSTE - REGRA DE NEGÓCIO #2] Atualiza urgência na resposta direta
+                "urgencia": self.classificar_urgencia(v["data_validade"], v["validade_texto"], agora),
+                "alertas": v["alertas"],
+            }
         if campo == "itens":
             return {"itens": self.extrair_itens(texto)}
         if campo == "categorias":
@@ -592,6 +624,8 @@ class ExtratorEntidades:
                     it["reconhecido"] = True
         r["categorias"] = self.unir_categorias(itens)
         r["descricao_alimento"] = self.descrever_itens(itens) or None
+        # [NOVO AJUSTE - REGRA DE NEGÓCIO #2] Garante que a urgência esteja sempre sincronizada
+        r["urgencia"] = self.classificar_urgencia(r.get("data_validade"), r.get("validade_texto"))
         return r
 
 
