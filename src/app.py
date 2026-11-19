@@ -584,7 +584,7 @@ def main():
 
     # [NOVO AJUSTE - LAYOUT #1] Exibição do logotipo da pasta assets/ na barra lateral
     for ext in ("png", "jpg", "jpeg", "webp"):
-        caminho_logo = f"assets/logo.{ext}"
+        caminho_logo = f"assets/logo_mesafartai.{ext}"
         if os.path.exists(caminho_logo):
             st.sidebar.image(caminho_logo, width=180)
             break
@@ -592,7 +592,7 @@ def main():
     st.sidebar.title("🍽️ MESAFARTAI")
     st.sidebar.caption("Conectando quem tem alimento a quem combate a fome.")
     # [NOVO AJUSTE - LAYOUT #2] Selo ODS 2 e créditos da equipe na barra lateral
-    st.sidebar.info("🌱 **ODS 2 — Fome Zero e Agricultura Sustentável**")
+    st.sidebar.info("🌱 **ODS 2 — Fome Zero**")
 
     pagina = st.sidebar.radio("Menu", ["💬 Quero doar", "🔎 Acompanhar doação", "ℹ️ Como funciona", "🔐 Administração"],
                               key="menu")
