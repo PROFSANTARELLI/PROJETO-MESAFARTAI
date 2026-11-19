@@ -12,9 +12,8 @@ Este arquivo é só front-end. As regras ficam nos módulos:
 Para rodar:   streamlit run src/app.py
 """
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
-
 import pandas as pd
 import streamlit as st
 
@@ -45,6 +44,35 @@ from nlu import MotorNLU  # noqa: E402
 FUSO = "America/Sao_Paulo"
 PRECISAO = {"numero": "endereço exato", "cep": "CEP (rua/bairro)", "aproximada": "aproximada",
             "demonstracao": "dado de demonstração"}
+
+
+# ============================================================================
+# [NOVO AJUSTE - REGRA DE NEGÓCIO] Classificação de Urgência por Validade
+# ============================================================================
+def classificar_urgencia_validade(data_validade):
+    """Calcula a prioridade logística com base na data de validade da doação."""
+    if not data_validade or pd.isna(data_validade):
+        return "🟢 NORMAL"
+    try:
+        # Tenta interpretar formatos comuns (YYYY-MM-DD ou DD/MM/YYYY)
+        val_str = str(data_validade).strip()
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                dt_val = datetime.strptime(val_str[:10], fmt).date()
+                break
+            except ValueError:
+                dt_val = None
+        if dt_val is None:
+            return "🟢 NORMAL"
+
+        dias_restantes = (dt_val - datetime.now().date()).days
+        if dias_restantes <= 0:
+            return "🚨 ALTA (Hoje)"
+        elif dias_restantes == 1:
+            return "⚠️ MÉDIA (24h)"
+        return "🟢 NORMAL"
+    except Exception:
+        return "🟢 NORMAL"
 
 
 # ============================================================================
@@ -110,6 +138,8 @@ def enviar(conversa, texto):
         st.markdown(texto)
     with st.spinner("Pensando..."):
         conversa.enviar(texto)
+    # [NOVO AJUSTE - LAYOUT/UX] Feedback instantâneo ao processar mensagem
+    st.toast("Mensagem processada pelo assistente!", icon="🍽️")
     st.rerun()
 
 
@@ -127,6 +157,9 @@ def pagina_consulta():
         if enviado:
             doacao = db.buscar_doacao_por_protocolo(protocolo)
             if doacao:
+                # [NOVO AJUSTE - REGRA DE NEGÓCIO] Exibe badge de prioridade logística na consulta
+                urgencia = classificar_urgencia_validade(doacao.get("data_validade"))
+                st.info(f"**Prioridade Logística:** {urgencia}")
                 st.markdown(formatar_doacao(doacao))
             else:
                 st.error("Não encontrei nenhuma doação com esse protocolo. Confira o código e tente novamente.")
@@ -261,13 +294,23 @@ def dashboard():
     dist_media = matches.loc[matches["status"] == "ACEITO", "distancia_km"].mean() if not matches.empty else float("nan")
     kg = itens.loc[itens["unidade"] == "kg", "quantidade"].sum() if not itens.empty else 0
 
-    m = st.columns(5)
+    # [NOVO AJUSTE - REGRA DE NEGÓCIO #1] Estimativa de Impacto Social ODS 2 (500g = 1 refeição)
+    refeicoes_estimadas = int(kg * 2)
+
+    # [NOVO AJUSTE - REGRA DE NEGÓCIO #2] Alerta de doações com urgência ALTA pendentes de coleta
+    doacoes["urgencia"] = doacoes["data_validade"].apply(classificar_urgencia_validade)
+    urgentes_pendentes = doacoes[(doacoes["urgencia"].str.contains("ALTA")) & (doacoes["status"] == "ACEITA")]
+    if not urgentes_pendentes.empty:
+        st.warning(f"🚨 **Atenção Logística:** Existem **{len(urgentes_pendentes)}** doação(ões) aceita(s) com vencimento hoje aguardando coleta imediata!")
+
+    m = st.columns(6)
     m[0].metric("Doações registradas", total)
     m[1].metric("Aceitas pelo doador", aceitas, f"{aceitas / total:.0%} do total", delta_color="off")
     m[2].metric("Sem destino", sem_destino, f"{sem_destino / total:.0%} do total", delta_color="off")
     m[3].metric("Distância média (aceitas)", "—" if pd.isna(dist_media) else f"{dist_media:.1f} km".replace(".", ","))
     m[4].metric("Itens em kg", f"{kg:g} kg", help="Soma só os itens informados em kg; litros, caixas e "
                                                   "dúzias não são somados porque não são comparáveis.")
+    m[5].metric("Refeições (ODS 2)", f"~{refeicoes_estimadas}", help="Estimativa baseada em 500g por refeição.")
     st.divider()
 
     c1, c2 = st.columns(2)
@@ -488,6 +531,9 @@ def aba_registro_doacoes():
         return
 
     doacoes["registrada em"] = _para_local(doacoes["criado_em"]).dt.strftime("%d/%m/%Y %H:%M")
+    # [NOVO AJUSTE - REGRA DE NEGÓCIO #2] Coluna de prioridade logística por validade
+    doacoes["prioridade"] = doacoes["data_validade"].apply(classificar_urgencia_validade)
+
     f1, f2 = st.columns([2, 3])
     status = f1.multiselect("Situação", sorted(doacoes["status"].unique()), default=sorted(doacoes["status"].unique()))
     busca = f2.text_input("Buscar", placeholder="protocolo, doador, e-mail ou alimento")
@@ -498,7 +544,7 @@ def aba_registro_doacoes():
         vis = vis[alvo.str.contains(busca.strip().lower(), regex=False)]
 
     tabela = vis[["protocolo", "registrada em", "doador_nome", "doador_email", "descricao_alimento", "categorias",
-                  "data_validade", "status", "ong_aceita", "distancia_aceita"]].rename(columns={
+                  "data_validade", "prioridade", "status", "ong_aceita", "distancia_aceita"]].rename(columns={
         "doador_nome": "doador", "doador_email": "e-mail", "descricao_alimento": "itens",
         "data_validade": "validade", "ong_aceita": "ONG", "distancia_aceita": "km"})
     st.dataframe(tabela, width="stretch", hide_index=True)
@@ -515,6 +561,7 @@ def aba_registro_doacoes():
         a.markdown(f"**Doador:** {d['doador_nome']} · {d['doador_email']}  \n"
                    f"**Local:** {d['endereco_texto'] or d['cep'] or '—'}  \n"
                    f"**Validade:** {d['data_validade'] or 'não informada'}  \n"
+                   f"**Prioridade:** {classificar_urgencia_validade(d['data_validade'])}  \n"
                    f"**Situação:** {d['status']}")
         b.dataframe(pd.DataFrame(d["itens"]).rename(columns={"alimento": "alimento", "categorias": "categorias"}),
                     width="stretch", hide_index=True)
@@ -534,13 +581,28 @@ def aba_registro_doacoes():
 def main():
     s = servicos()
     garantir_banco()
+
+    # [NOVO AJUSTE - LAYOUT #1] Exibição do logotipo da pasta assets/ na barra lateral
+    for ext in ("png", "jpg", "jpeg", "webp"):
+        caminho_logo = f"assets/logo.{ext}"
+        if os.path.exists(caminho_logo):
+            st.sidebar.image(caminho_logo, width=180)
+            break
+
     st.sidebar.title("🍽️ MESAFARTAI")
     st.sidebar.caption("Conectando quem tem alimento a quem combate a fome.")
+    # [NOVO AJUSTE - LAYOUT #2] Selo ODS 2 e créditos da equipe na barra lateral
+    st.sidebar.info("🌱 **ODS 2 — Fome Zero e Agricultura Sustentável**")
+
     pagina = st.sidebar.radio("Menu", ["💬 Quero doar", "🔎 Acompanhar doação", "ℹ️ Como funciona", "🔐 Administração"],
                               key="menu")
     if pagina == "💬 Quero doar" and st.sidebar.button("🔄 Nova conversa", width="stretch"):
         st.session_state.pop("conversa", None)
         st.rerun()
+
+    # [NOVO AJUSTE - LAYOUT #3] Rodapé lateral com identificação do grupo
+    st.sidebar.divider()
+    st.sidebar.caption("👥 **Equipe:** Integrante 1 · Integrante 2 · Integrante 3")
 
     if pagina == "💬 Quero doar":
         pagina_doar(s)
